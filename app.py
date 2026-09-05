@@ -44,7 +44,7 @@ def extract_text_from_pdf(pdf_file):
 
 def generate_quiz(text, num_questions, difficulty, q_type):
     # Using the recommended standard model
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
     
     prompt = f"""
     Based on the following context, generate a {num_questions}-question quiz.
