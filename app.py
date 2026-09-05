@@ -7,26 +7,32 @@ from pypdf import PdfReader
 # Page setup
 st.set_page_config(page_title="AI Quiz Generator", page_icon="📝", layout="wide")
 
-# Fetch API Key cleanly from Secrets or Environment
+# Initialize Session State
+if "quiz_data" not in st.session_state:
+    st.session_state["quiz_data"] = None
+if "quiz_submitted" not in st.session_state:
+    st.session_state["quiz_submitted"] = False
+if "user_answers" not in st.session_state:
+    st.session_state["user_answers"] = {}
+if "short_evaluations" not in st.session_state:
+    st.session_state["short_evaluations"] = {}
+
+# Fetch API Key
 api_key = ""
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
 elif "GEMINI_API_KEY" in os.environ:
     api_key = os.environ["GEMINI_API_KEY"]
 
-# Sidebar fallback if no key is configured in backend
 if not api_key:
     api_key = st.sidebar.text_input("Enter Gemini API Key", type="password")
 
-# Clean key from accidental whitespace or quotes
 api_key = api_key.strip().strip('"').strip("'") if api_key else ""
 
-# Stop execution cleanly if key is missing
 if not api_key:
     st.info("👈 Please enter your Gemini API Key in the sidebar or configure it in Streamlit Secrets to continue.")
     st.stop()
 
-# Configure GenAI SDK only when a valid key string exists
 try:
     genai.configure(api_key=api_key)
 except Exception as e:
@@ -43,7 +49,6 @@ def extract_text_from_pdf(pdf_file):
     return text
 
 def generate_quiz(text, num_questions, difficulty, q_type):
-    # Using the recommended standard model
     model = genai.GenerativeModel('gemini-3.6-flash')
     
     prompt = f"""
@@ -54,9 +59,26 @@ def generate_quiz(text, num_questions, difficulty, q_type):
     Context:
     {text[:8000]}
 
-    Return ONLY a valid JSON array of objects with keys: "question", "options" (array if MCQ/TF), "answer", "explanation".
+    Return ONLY a valid JSON array of objects with keys: "question", "options" (array if MCQ/TF, empty list if short answer), "answer", "explanation".
     """
     
+    response = model.generate_content(
+        prompt,
+        generation_config={"response_mime_type": "application/json"}
+    )
+    return json.loads(response.text)
+
+def evaluate_short_answer(question, expected_answer, user_answer):
+    model = genai.GenerativeModel('gemini-3.6-flash')
+    prompt = f"""
+    Question: {question}
+    Expected Key Concepts: {expected_answer}
+    Student Answer: {user_answer}
+
+    Grade the student's answer. Return ONLY a valid JSON object with keys:
+    - "is_correct": true or false
+    - "feedback": "Brief 1-2 sentence feedback explaining why it's correct or what was missed."
+    """
     response = model.generate_content(
         prompt,
         generation_config={"response_mime_type": "application/json"}
@@ -81,54 +103,99 @@ if uploaded_file:
     if st.button("Generate Quiz"):
         with st.spinner("Generating quiz with Gemini..."):
             try:
-                quiz_data = generate_quiz(pdf_text, num_q, difficulty, q_type)
-                st.session_state["quiz_data"] = quiz_data
+                st.session_state["quiz_data"] = generate_quiz(pdf_text, num_q, difficulty, q_type)
+                st.session_state["quiz_submitted"] = False
                 st.session_state["user_answers"] = {}
-                st.session_state["submitted"] = False
+                st.session_state["short_evaluations"] = {}
+                st.rerun()
             except Exception as e:
                 st.error(f"Error generating quiz: {e}")
 
-if "quiz_data" in st.session_state:
-    st.header("🎯 Take Quiz")
+# Render Quiz Section
+if st.session_state["quiz_data"]:
     quiz = st.session_state["quiz_data"]
 
-    with st.form("quiz_form"):
-        for idx, q in enumerate(quiz):
-            st.subheader(f"Q{idx+1}: {q['question']}")
-            
-            if "options" in q and q["options"]:
-                user_choice = st.radio(f"Select answer for Q{idx+1}", q["options"], key=f"q_{idx}")
-                st.session_state["user_answers"][idx] = user_choice
-            else:
-                user_text = st.text_input(f"Your Answer for Q{idx+1}", key=f"q_{idx}")
-                st.session_state["user_answers"][idx] = user_text
+    # MODE 1: Answering Quiz
+    if not st.session_state["quiz_submitted"]:
+        st.header("🎯 Take Quiz")
+        
+        with st.form("quiz_input_form"):
+            for idx, q in enumerate(quiz):
+                st.subheader(f"Q{idx+1}: {q['question']}")
+                
+                # index=None forces radio buttons to start completely unselected
+                if "options" in q and q["options"]:
+                    selected_val = st.radio(
+                        f"Select your answer for Q{idx+1}:",
+                        q["options"],
+                        index=None,
+                        key=f"user_q_{idx}"
+                    )
+                    st.session_state["user_answers"][idx] = selected_val
+                else:
+                    input_val = st.text_area(
+                        f"Write your answer for Q{idx+1}:",
+                        key=f"user_q_{idx}"
+                    )
+                    st.session_state["user_answers"][idx] = input_val
+                st.divider()
 
-        submit_btn = st.form_submit_button("Submit Quiz")
+            submit_btn = st.form_submit_button("Submit Answers")
+            if submit_btn:
+                # Validation check: Ensure all questions are answered
+                unanswered = [i + 1 for i, ans in st.session_state["user_answers"].items() if ans is None or str(ans).strip() == ""]
+                
+                if unanswered:
+                    st.error(f"Please answer all questions before submitting! Unanswered: Question(s) {', '.join(map(str, unanswered))}")
+                else:
+                    has_options = "options" in quiz[0] and quiz[0]["options"]
+                    if not has_options:
+                        with st.spinner("AI is grading your short answers..."):
+                            for idx, q in enumerate(quiz):
+                                u_ans = st.session_state["user_answers"].get(idx, "")
+                                st.session_state["short_evaluations"][idx] = evaluate_short_answer(
+                                    q["question"], q["answer"], u_ans
+                                )
+                    st.session_state["quiz_submitted"] = True
+                    st.rerun()
 
-    if submit_btn:
-        st.session_state["submitted"] = True
-
-    if st.session_state.get("submitted", False):
+    # MODE 2: Results & Explanations
+    else:
         st.header("📊 Quiz Results")
         score = 0
-        
+        has_options = "options" in quiz[0] and quiz[0]["options"]
+
         for idx, q in enumerate(quiz):
-            user_ans = st.session_state["user_answers"].get(idx, "")
+            user_ans = st.session_state["user_answers"].get(idx, "No Answer")
             st.write(f"**Q{idx+1}: {q['question']}**")
             
-            if "options" in q and q["options"]:
-                if user_ans == q["answer"]:
+            # Grading MCQs & True/False
+            if has_options:
+                if str(user_ans).strip().lower() == str(q['answer']).strip().lower():
                     score += 1
-                    st.success(f"Your Answer: {user_ans} (Correct!)")
+                    st.success(f"✅ Your Answer: {user_ans} (Correct!)")
                 else:
-                    st.error(f"Your Answer: {user_ans} | Correct Answer: {q['answer']}")
+                    st.error(f"❌ Your Answer: {user_ans} | Correct Answer: {q['answer']}")
+                st.caption(f"Explanation: {q.get('explanation', 'N/A')}")
+            
+            # Short Answer Results
             else:
-                st.info(f"Your Answer: {user_ans}")
-                st.success(f"Ideal Answer Keywords: {q['answer']}")
+                eval_res = st.session_state["short_evaluations"].get(idx, {})
+                if eval_res.get("is_correct", False):
+                    score += 1
+                    st.success(f"✅ Your Answer: {user_ans}")
+                else:
+                    st.error(f"❌ Your Answer: {user_ans}")
+                
+                st.write(f"**AI Evaluation:** {eval_res.get('feedback', '')}")
+                st.info(f"💡 Expected Key Concepts: {q['answer']}")
 
-            st.caption(f"Explanation: {q.get('explanation', 'N/A')}")
             st.divider()
 
-        if "options" in quiz[0] and quiz[0]["options"]:
-            st.balloons()
-            st.metric("Final Score", f"{score} / {len(quiz)}")
+        st.balloons()
+        st.metric("Final Score", f"{score} / {len(quiz)}")
+
+        if st.button("Retake Quiz"):
+            st.session_state["quiz_submitted"] = False
+            st.session_state["short_evaluations"] = {}
+            st.rerun()
